@@ -4,7 +4,60 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from .idynamic import IDynamicDWConv
 import numbers
+
+class DWBlock(nn.Module):
+    def __init__(self, dim, window_size, dynamic=False, inhomogeneous=False, heads=None):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size  # Wh, Ww
+        self.dynamic = dynamic
+        self.inhomogeneous = inhomogeneous
+        self.heads = heads
+
+        # pw-linear
+        self.conv0 = nn.Conv2d(dim, dim, 1, bias=False)
+
+        if dynamic and inhomogeneous:
+            print(window_size, heads)
+            self.conv = IDynamicDWConv(dim, window_size, heads)
+        else:
+            self.conv = nn.Conv2d(dim, dim, kernel_size=window_size, stride=1, padding=window_size // 2, groups=dim)
+
+        # pw-linear
+        self.conv2 = nn.Conv2d(dim, dim, 1, bias=False)
+
+    def forward(self, x):
+        B, H, W, C = x.shape
+        x = x.permute(0, 3, 1, 2).contiguous()
+        x = self.conv0(x)
+        x = self.conv(x)
+        x = self.conv2(x)
+        x = x.permute(0, 2, 3, 1).contiguous()
+        return x
+
+    def extra_repr(self) -> str:
+        return f'dim={self.dim}, window_size={self.window_size}'
+
+    def flops(self, N):
+        # calculate flops for 1 window with token length of N
+        flops = 0
+        # x = self.conv0(x)
+        flops += N * self.dim * self.dim
+        # x = self.conv(x)
+        if self.dynamic and not self.inhomogeneous:
+            flops += (
+                        N * self.dim + self.dim * self.dim / 4 + self.dim / 4 * self.dim * self.window_size * self.window_size)
+        elif self.dynamic and self.inhomogeneous:
+            flops += (
+                        N * self.dim * self.dim / 4 + N * self.dim / 4 * self.dim / self.heads * self.window_size * self.window_size)
+        flops += N * self.dim * self.window_size * self.window_size
+        #  x = self.conv2(x)
+        flops += N * self.dim * self.dim
+        #  batchnorm + relu
+        flops += 8 * self.dim * N
+        return flops
 
 
 class SCM(nn.Module):
@@ -99,47 +152,119 @@ class GDFN(nn.Module):
         x = self.project_out(x)
         return x
 
-
+##########################################################################
 ## Multi-DConv Head Transposed Self-Attention (MDTA)
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads, bias=False):
-        super(Attention, self).__init__()
-        self.num_heads = num_heads
-        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+class SpatialGatingUnit(nn.Module):
+    def __init__(
+        self,
+        dim,
+        patch_size=16,
+        act = nn.Identity(),
+        heads = 1,
+        init_eps = 1e-3,
+    ):
+        super().__init__()
+        dim_out = dim // 2
+        self.heads = heads
+        self.norm = nn.LayerNorm(dim_out)
+        self.dim = dim_out
+        self.act = act
 
-        self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=bias)
-        self.qkv_dwconv = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, stride=1, padding=1, groups=dim * 3, bias=bias)
-        self.project_out = nn.Conv2d(dim * 3, dim, kernel_size=1, bias=bias)
+        self.attn2conv = DWBlock(dim_out, 7, dynamic=True, inhomogeneous=True, heads=dim_out)
+
+    def forward(self, x,x_cnn_dw):
+
+        n, h = x.shape[1], self.heads
+
+        res, gate = x.chunk(2, dim = -1)
+
+        # x_cnn_dw: (512 24 1 1) gate: (2 256 64 24)
+
+        x_cnn_dw = rearrange(x_cnn_dw, 'b c ph pw -> b (ph pw) c')
+        gate = rearrange(gate, 'b n p c -> (b n) p c')
+
+        gate = gate * x_cnn_dw
+
+        res = rearrange(res, 'b n p c -> (b n) p c')
+        gate = self.norm(gate)
+        gate = self.attn2conv(rearrange(gate, 'b (h w) n -> b h w n', h=8, w=8))
+        gate = rearrange(gate, 'b h w n -> b (h w) n')
+
+
+        return self.act(gate) * res
+
+
+class gmlp_mix(nn.Module):
+    def __init__(self, dim, patch_size=8, head=1):
+        super(gmlp_mix, self).__init__()
+
+
+        self.to_hidden = nn.Conv2d(dim, dim , kernel_size=1)
+        self.x_cnn = nn.Sequential(nn.Conv2d(dim, dim , kernel_size=1),
+                                   LayerNorm(dim , LayerNorm_type='WithBias'),
+                                   nn.Conv2d(dim , dim , kernel_size=3, stride=1, padding=1, groups=dim),
+                                   nn.GELU()
+                                   )
+        self.act = nn.GELU()
+        self.SGU = SpatialGatingUnit(dim,patch_size=patch_size,heads=head)
+        self.channel_interaction = nn.Sequential(
+            nn.Conv2d(dim, dim // 8, kernel_size=1),
+            LayerNorm(dim //8, LayerNorm_type='WithBias'),
+            nn.GELU(),
+            nn.Conv2d(dim // 8, dim // 2, kernel_size=1),
+        )
+        self.spatial_interaction = nn.Sequential(
+            nn.Conv2d(dim // 2, dim // 16, kernel_size=1),
+            LayerNorm(dim //16, LayerNorm_type='WithBias'),
+            nn.GELU(),
+            nn.Conv2d(dim // 16, 1, kernel_size=1)
+        )
+
+        self.projection = nn.Conv2d(dim , dim//2, kernel_size=1)
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1)
+
+
+        self.patch_size = patch_size
 
     def forward(self, x):
+
         b, c, h, w = x.shape
 
-        qkv = self.qkv_dwconv(self.qkv(x))
-        # q, k, v = qkv.chunk(3, dim=1)
-        #
-        # q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        # k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        # v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
-        #
-        # q = torch.nn.functional.normalize(q, dim=-1)
-        # k = torch.nn.functional.normalize(k, dim=-1)
-        #
-        # attn = (q @ k.transpose(-2, -1)) * self.temperature
-        # attn = attn.softmax(dim=-1)
-        #
-        # out = (attn @ v)
+        x = self.to_hidden(x)
+        x = self.act(x)
+        x = rearrange(x, 'b c (h patch1) (w patch2) ->b (h w)  (patch1 patch2) c', patch1=self.patch_size,
+                  patch2=self.patch_size)
 
-        # out = rearrange(qkv, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
+        x_cnn = self.x_cnn(rearrange(x, 'b n (ph pw) c -> (b n) c ph pw', ph=self.patch_size, pw=self.patch_size))
 
-        out = self.project_out(qkv)
+        x_cnn_dw = self.channel_interaction(F.adaptive_avg_pool2d(x_cnn, output_size=1))
+        x_cnn_dw = F.sigmoid(x_cnn_dw)
+
+        x = self.SGU(x,x_cnn_dw)
+
+        x_cnn = rearrange(x_cnn, '(b h w) c ph pw ->b c (h ph) (w pw)',b=b, h=h//self.patch_size, w=w//self.patch_size,
+                          ph=self.patch_size, pw=self.patch_size)
+
+        x = rearrange(x, '(b h w)  (patch1 patch2) c ->b c (h patch1) (w patch2) ', b = b,h=h//self.patch_size,
+                      w = w//self.patch_size,patch1=self.patch_size,patch2=self.patch_size)
+
+        x_att = x.clone() #c=dim//2
+        x = self.spatial_interaction(x)
+        x = F.sigmoid(x)
+        # x_cnn: (256 48 128 128) x: (1 1 128 128)
+        x = self.projection(x_cnn) * x
+
+        out = torch.cat((x,x_att),dim=1)
+
+
+        out = self.project_out(out)
+
         return out
-
 
 class Atb(nn.Module):
     def __init__(self, n_feat):
         super(Atb, self).__init__()
         self.n_feat = n_feat
-        # self.attn = Attention(n_feat, 1)
         self.conv1 = nn.Conv2d(n_feat * 2, n_feat * 2, 1, 1, 0, bias=True)
         self.conv2 = nn.Conv2d(n_feat, n_feat, 3, 1, 1, bias=True)
         self.conv3 = nn.Conv2d(n_feat, n_feat, 3, 1, 1, bias=True)
@@ -165,7 +290,7 @@ class Fuse(nn.Module):
         self.norm1 = LayerNorm(self.n_feat, LayerNorm_type='WithBias')
         self.norm = LayerNorm(self.n_feat, LayerNorm_type='WithBias')
         self.att_channel = GDFN(n_feat, n_feat)
-        self.attn = Attention(n_feat, 1)
+        self.attn = gmlp_mix(n_feat, patch_size=8)
 
     def forward(self, enc, dnc):
         dnc = F.interpolate(dnc, scale_factor=1 / self.scale_factor, mode='bilinear')
@@ -183,7 +308,7 @@ class Conv(nn.Module):
         m = []
         m.append(nn.Conv2d(input_channels, n_feats, kernel_size, stride, padding, bias=bias))
         if bn: m.append(nn.BatchNorm2d(n_feats))
-        if act: m.append(nn.ReLU(True))
+        if act: m.append(nn.GELU())
         self.body = nn.Sequential(*m)
 
     def forward(self, input):
@@ -311,9 +436,9 @@ class SRN(nn.Module):
 
 
 @ARCH_REGISTRY.register()
-class vivo_stage3_final_v49_stage4ks5To3Noattention(nn.Module):
+class MBDFNet(nn.Module):
     def __init__(self, scale_fact):
-        super(vivo_stage3_final_v49_stage4ks5To3Noattention, self).__init__()
+        super(baseline, self).__init__()
         self.scale_fact = scale_fact
         self.srn1 = SRN(in_channels=3, out_channels=3, n_resblock=6, n_feat=16, kernel_size=3, ispre=False)
         self.srn2 = SRN(in_channels=3, out_channels=3, n_resblock=3, n_feat=16, kernel_size=3, ispre=True,
@@ -391,11 +516,13 @@ class vivo_stage3_final_v49_stage4ks5To3Noattention(nn.Module):
         return x_scale1_out[:, :, :H_in, :W_in], x_scale2_out[:, :, :int(H_in*0.75), :int(W_in*0.75)], x_scale4_out[:, :, :int(H_in*0.75**2), :int(W_in*0.75**2)], x_scale8_out[:, :, :int(H_in*0.75**3), :int(W_in*0.75**3)]
 
 if __name__ == '__main__':
-    from fvcore.nn import flop_count_str, flop_count_table, FlopCountAnalysis, ActivationCountAnalysis
-    model = vivo_stage3_final_v49_stage4ks5To3Noattention(0.75).cuda()
+    model = MBDFNet(0.75).cuda()
 
-    input = torch.ones(1, 3, 256, 256).cuda()
+    input = x = torch.ones(1, 3, 256, 256).cuda()
     out = model(input)
-
-    # print(out.size())
-    print(flop_count_table(FlopCountAnalysis(model, input), activations=ActivationCountAnalysis(model, input)))
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            print(name)
+    print(f'out_1_size: {out[0].size()}; out_2_size: {out[1].size()}; out_3_size: {out[2].size()}; out_4_size: {out[3].size()}')
+    flops, params = profile(model, inputs=(input,))
+    print(flops / 1e9, params / 1e6)
