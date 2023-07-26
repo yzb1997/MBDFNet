@@ -438,7 +438,7 @@ class SRN(nn.Module):
 @ARCH_REGISTRY.register()
 class MBDFNet(nn.Module):
     def __init__(self, scale_fact):
-        super(baseline, self).__init__()
+        super(MBDFNet, self).__init__()
         self.scale_fact = scale_fact
         self.srn1 = SRN(in_channels=3, out_channels=3, n_resblock=6, n_feat=16, kernel_size=3, ispre=False)
         self.srn2 = SRN(in_channels=3, out_channels=3, n_resblock=3, n_feat=16, kernel_size=3, ispre=True,
