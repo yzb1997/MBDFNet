@@ -6,8 +6,9 @@ This repository provides the official PyTorch implementation of the following pa
 >
 > Zhongbao Yang, Jinshan Pan
 >
-> In ICME 2023. 
->
+> In ICME 2023.
+> 
+> Paper: [https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=10219849](https://ieeexplore.ieee.org/document/10219849)
 >
 > Abstract: Existing deep image deblurring models achieve favorable results with growing model complexity. However, these models cannot be applied to those low-power devices with resource constraints (e.g., smart phones) as these models usually have lots of network parameters and require computational costs. To overcome this problem, we develop a multi-scale bidirectional dynamic feature fusion network (MBDFNet), a lightweight deep deblurring model, for efficient image deblurring. The proposed MBDFNet progressively restores multi-scale latent clear images from blurry input based on a multi-scale framework. To better utilize the features from coarse scales, we propose a bidirectional gated dynamic fusion module so that the most useful information of the features from coarse scales are kept to facilitate the estimations in the finer scales. We solve the proposed MBDFNet in an end-to-end manner and show that it has fewer network parameters and lower FLOPs values, where the FLOPs value of the proposed MBDFNet is at least $6\times$ smaller than the state-of-the-art methods.Both quantitative and qualitative evaluations show that the proposed MBDFNet achieves favorable performance in terms of model complexity while having competitive performance in terms of accuracy against state-of-the-art methods. 
 
